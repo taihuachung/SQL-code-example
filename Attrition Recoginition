@@ -1,0 +1,173 @@
+
+
+/* Create base table */
+
+select * from sandbox.taihua_attr_def_mbase limit 10;
+
+alter table sandbox.taihua_attr_def_mbase add column closedate_adj varchar(6);
+alter table sandbox.taihua_attr_def_mbase add column ecognadate_adj varchar(6);
+
+update sandbox.taihua_attr_def_mbase a
+set 
+closedate_adj = case when echognadate is null then null when closedate is not null then to_char(closedate,'YYYYMM') else '201907' end,
+ecognadate_adj = case when echognadate is not null then to_char(echognadate,'YYYYMM') else null end
+;
+
+drop table if exists sandbox.taihua_attr_trend;
+create table sandbox.taihua_attr_trend as /*+ DIRECT */ 
+select a.display_date, a.date_start, a.date_end, a.fiscal_year, 
+       b.merchantid, b.sicgroup, b.leadchannelgroup, b.closedate_adj, b.ecognadate_adj, months_between(to_date(closedate_adj,'YYYYMM'), to_date(ecognadate_adj,'YYYYMM')) as payment_hist_length
+from sandbox.taihua_calendar_month a
+right join sandbox.taihua_attr_def_mbase b
+on a.display_date between b.ecognadate_adj and b.closedate_adj
+order by merchantid, display_date
+;
+
+
+--select * from sandbox.taihua_attr_trend order by merchantid, display_date;
+
+
+-- Months since first transaction
+
+alter table sandbox.taihua_attr_trend add column MOB integer;
+
+update sandbox.taihua_attr_trend a
+set MOB = months_between(to_date(display_date,'YYYYMM'), to_date(ecognadate_adj,'YYYYMM'))
+;
+
+
+-- transaction records
+
+alter table sandbox.taihua_attr_trend add column txn_f integer;
+alter table sandbox.taihua_attr_trend add column txn_cnt integer;
+alter table sandbox.taihua_attr_trend add column txn_sum float;
+
+update sandbox.taihua_attr_trend a
+set txn_f = case when b.txn_cnt >0 then 1 else 0 end,
+    txn_cnt = b.txn_cnt,
+    txn_sum = b.txn_sum
+from (
+      select merchant_id, to_char(transaction_date,'YYYYMM') as txn_mon, --max(case when transaction_amount > 0 then 1 else 0 end) as txn_f,
+             count(*) as txn_cnt, sum(transaction_amount) as txn_sum
+      from dm.pymt_transactions_vw 
+      where transaction_date >= '2015-08-01' 
+      and is_rejected_ind = 'False'
+      and fund_batch_date is not null
+      and fund_batch_date >= transaction_date
+      group by merchant_id, txn_mon
+     ) b
+where a.merchantid = b.merchant_id and b.txn_mon = a.display_date
+;
+
+
+-- non-active month
+
+alter table sandbox.taihua_attr_trend add column non_txn_f integer;
+
+update sandbox.taihua_attr_trend a
+set non_txn_f = case when txn_f = 1 then 0 else 1 end
+;
+
+
+/* Attrition Recognition: not using product for 3 consecutive months */
+
+--Identify the transition from using product to not using product
+
+alter table sandbox.taihua_attr_trend add column act_change_tag integer;
+
+update sandbox.taihua_attr_trend a
+set act_change_tag = b.tag
+from (
+      select merchantid, display_date,
+             case when non_txn_f = lag(non_txn_f,1) over (partition by merchantid order by mob) then 0 else 1 end as tag
+      from sandbox.taihua_attr_trend
+     ) b
+where a.merchantid = b.merchantid and a.display_date = b.display_date
+;
+
+
+-- Group the months based on the transition
+
+alter table sandbox.taihua_attr_trend add column act_change_group integer;
+
+update sandbox.taihua_attr_trend a
+set act_change_group = b.grp
+from (
+      select merchantid, display_date,
+             sum(act_change_tag) over (partition by merchantid order by mob) as grp
+      from sandbox.taihua_attr_trend
+     ) b
+where a.merchantid = b.merchantid and a.display_date = b.display_date
+;
+
+
+-- Calculate consecutive non-active months
+
+alter table sandbox.taihua_attr_trend add column consec_non_txn_mon integer;
+
+update sandbox.taihua_attr_trend a
+set consec_non_txn_mon = b.consec_non_txn_mon
+from (
+      select merchantid, mob, txn_f, non_txn_f, SUM(non_txn_f) OVER (PARTITION BY merchantid, act_change_group ORDER BY mob) as consec_non_txn_mon
+      from sandbox.taihua_attr_trend
+      order by merchantid, mob
+     ) b
+where a.merchantid = b.merchantid and a.mob = b.mob
+;
+
+
+-- Attrition Flag (Def: Interval >= 3 months)
+
+alter table sandbox.taihua_attr_trend add column attr_flag integer;
+
+update sandbox.taihua_attr_trend a
+set attr_flag = case when consec_non_txn_mon >= 3 then 1 else 0 end
+;
+
+update sandbox.taihua_attr_trend a
+set attr_flag = b.tag
+from (
+      select merchantid, mob, max(attr_flag) over (partition by merchantid order by mob) as tag
+      from sandbox.taihua_attr_trend
+      order by merchantid, mob
+     ) b
+where a.merchantid = b.merchantid and a.mob = b.mob
+;
+
+
+/* Attrition Recognition 2: two std from avg interval months */
+
+-- Txn Interval Cutoff
+
+alter table sandbox.taihua_attr_trend add column txn_interval_cutoff float;
+
+update sandbox.taihua_attr_trend a
+set txn_interval_cutoff = b.cutoff
+from (
+      select merchantid, avg_txn_interval_mons + 2*std_txn_interval_mons as cutoff
+      from sandbox.taihua_attr_def_merchant_mon_avg
+     ) b
+where a.merchantid = b.merchantid
+;
+
+
+-- Attrition Flag2 (Def: merchant individual avg. interval + 2 std)
+
+alter table sandbox.taihua_attr_trend add column attr_flag2 float;
+
+update sandbox.taihua_attr_trend a
+set attr_flag2 = case when consec_non_txn_mon > txn_interval_cutoff then 1 else 0 end
+;
+
+update sandbox.taihua_attr_trend a
+set attr_flag2 = b.tag
+from (
+      select merchantid, mob, max(attr_flag) over (partition by merchantid order by mob) as tag
+      from sandbox.taihua_attr_trend
+      --order by merchantid, mob
+     ) b
+where a.merchantid = b.merchantid and a.mob = b.mob
+;
+
+
+
